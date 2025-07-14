@@ -1,0 +1,268 @@
+#!/usr/bin/env bash
+
+# @describe Whoxy API client for domain intelligence and reverse WHOIS lookups
+# @arg command "Command to run (history, name, email, company, keyword)" [string]
+# @arg value "Value to search for" [string]
+# @option -k --key "Whoxy API key (can also use WHOXY_API_KEY env var)" [string]
+# @option -p --page "Page number for results pagination" [int] @default "1"
+# @option -m --mode "Result mode: normal, mini, micro, domains (domains only works with keyword)" [string] @default "normal"
+# @flag   -j --json "Output raw JSON instead of formatted results"
+# @flag   -q --quiet "Suppress colored output"
+# @meta require-tools curl,jq
+
+eval "$(argc --argc-eval "$0" "$@")"
+
+# Setup colors
+setup_colors() {
+  if [ "$argc_quiet" = 1 ] || [ -z "$TERM" ] || [ "$TERM" = "dumb" ]; then
+    bold="" reset="" blue="" green="" yellow="" cyan="" magenta="" red=""
+  else
+    bold=$(tput bold) reset=$(tput sgr0) blue=$(tput setaf 4) green=$(tput setaf 2)
+    yellow=$(tput setaf 3) cyan=$(tput setaf 6) magenta=$(tput setaf 5) red=$(tput setaf 1)
+  fi
+}
+setup_colors
+
+# Get API key from multiple sources
+get_api_key() {
+  if [ -n "$argc_key" ]; then
+    echo "$argc_key"
+  elif [ -n "$WHOXY_API_KEY" ]; then
+    echo "$WHOXY_API_KEY"
+  elif [ -f "$HOME/.config/whoxy/api_key" ]; then
+    cat "$HOME/.config/whoxy/api_key"
+  else
+    echo "${red}Error:${reset} No Whoxy API key found." >&2
+    echo "Either:" >&2
+    echo "  1. Pass it with --key" >&2
+    echo "  2. Set WHOXY_API_KEY environment variable" >&2
+    echo "  3. Save it to ~/.config/whoxy/api_key" >&2
+    exit 1
+  fi
+}
+API_KEY=$(get_api_key)
+
+# Helper functions
+print_kv() {
+  printf "${bold}%s:${reset} %s\n" "$1" "$2"
+}
+
+print_section() {
+  printf "\n${bold}%s:${reset}\n" "$1"
+}
+
+make_request() {
+  local url="$1"
+  local response=$(curl -s "$url")
+
+  # Check for API errors
+  if echo "$response" | jq -e '.status_code' >/dev/null 2>&1; then
+    local status=$(echo "$response" | jq -r '.status_code')
+    if [ "$status" != "1" ]; then
+      local error_msg=$(echo "$response" | jq -r '.status_reason // "Unknown error"')
+      printf "${red}Error:${reset} Whoxy API returned: ${red}%s${reset}\n" "$error_msg" >&2
+      exit 1
+    fi
+  fi
+
+  echo "$response"
+}
+
+format_contact() {
+  local contact="$1"
+  local type="$2"
+
+  local name=$(echo "$contact" | jq -r '.full_name // "N/A"')
+  local company=$(echo "$contact" | jq -r '.company_name // "N/A"')
+  local email=$(echo "$contact" | jq -r '.email_address // "N/A"')
+  local phone=$(echo "$contact" | jq -r '.phone_number // "N/A"')
+  local street=$(echo "$contact" | jq -r '.street_address // "N/A"')
+  local city=$(echo "$contact" | jq -r '.city_name // "N/A"')
+  local state=$(echo "$contact" | jq -r '.state_name // "N/A"')
+  local country=$(echo "$contact" | jq -r '.country_name // "N/A"')
+  local zip=$(echo "$contact" | jq -r '.zip_code // "N/A"')
+
+  printf "  ${bold}%s Contact:${reset}\n" "$type"
+  [ "$name" != "N/A" ] && printf "    ${cyan}Name:${reset} ${green}%s${reset}\n" "$name"
+  [ "$company" != "N/A" ] && printf "    ${cyan}Company:${reset} ${blue}%s${reset}\n" "$company"
+  [ "$email" != "N/A" ] && printf "    ${cyan}Email:${reset} ${blue}%s${reset}\n" "$email"
+  [ "$phone" != "N/A" ] && printf "    ${cyan}Phone:${reset} ${yellow}%s${reset}\n" "$phone"
+
+  if [ "$street" != "N/A" ] || [ "$city" != "N/A" ] || [ "$state" != "N/A" ] || [ "$country" != "N/A" ] || [ "$zip" != "N/A" ]; then
+    printf "    ${cyan}Address:${reset} "
+    [ "$street" != "N/A" ] && printf "%s, " "$street"
+    [ "$city" != "N/A" ] && printf "%s, " "$city"
+    [ "$state" != "N/A" ] && printf "%s " "$state"
+    [ "$zip" != "N/A" ] && printf "%s, " "$zip"
+    [ "$country" != "N/A" ] && printf "%s" "$country"
+    printf "\n"
+  fi
+}
+
+format_history() {
+  local response="$1"
+  local domain=$(echo "$response" | jq -r '.domain_name // "N/A"')
+  local total_pages=$(echo "$response" | jq -r '.total_pages // "N/A"')
+  local total_records=$(echo "$response" | jq -r '.total_result // "N/A"')
+
+  printf "${bold}Domain History:${reset} ${green}%s${reset}\n" "$domain"
+  printf "${bold}Total Records:${reset} ${yellow}%s${reset} (${yellow}%s${reset} pages)\n" "$total_records" "$total_pages"
+
+  echo "$response" | jq -r '.whois_records[] | "\(.query_time)|\(.registrant_contact)|\(.administrative_contact)"' |
+    while IFS="|" read -r query_time registrant_raw admin_raw; do
+      printf "\n${bold}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${reset}\n"
+      printf "${bold}Query Time:${reset} ${yellow}%s${reset}\n" "$query_time"
+
+      if [ "$registrant_raw" != "null" ]; then
+        format_contact "$registrant_raw" "Registrant"
+      fi
+
+      if [ "$admin_raw" != "null" ]; then
+        format_contact "$admin_raw" "Administrative"
+      fi
+    done
+}
+
+format_reverse_whois() {
+  local response="$1"
+  local search_type="$2"
+  local search_value="$3"
+
+  local total_results=$(echo "$response" | jq -r '.total_result // "N/A"')
+  local total_pages=$(echo "$response" | jq -r '.total_pages // "N/A"')
+  local current_page=$(echo "$response" | jq -r '.current_page // "N/A"')
+
+  printf "${bold}Reverse WHOIS Search:${reset} ${green}%s${reset} = ${blue}%s${reset}\n" "$search_type" "$search_value"
+  printf "${bold}Results:${reset} ${yellow}%s${reset} total (page ${yellow}%s${reset} of ${yellow}%s${reset})\n" "$total_results" "$current_page" "$total_pages"
+
+  # Handle different result modes
+  if [ "$argc_mode" = "domains" ]; then
+    print_section "Domain Names"
+    echo "$response" | jq -r '.search_result[]' | while read -r domain; do
+      printf "  ${green}%s${reset}\n" "$domain"
+    done
+  elif [ "$argc_mode" = "micro" ]; then
+    print_section "Micro Results"
+    echo "$response" | jq -r '.search_result[] | "\(.domain_name)|\(.create_date)|\(.update_date)|\(.expire_date)"' |
+      while IFS="|" read -r domain create update expire; do
+        printf "${bold}* ${green}%s${reset}\n" "$domain"
+        [ "$create" != "null" ] && printf "  ${cyan}Created:${reset} ${yellow}%s${reset}\n" "$create"
+        [ "$update" != "null" ] && printf "  ${cyan}Updated:${reset} ${yellow}%s${reset}\n" "$update"
+        [ "$expire" != "null" ] && printf "  ${cyan}Expires:${reset} ${yellow}%s${reset}\n" "$expire"
+      done
+  elif [ "$argc_mode" = "mini" ]; then
+    print_section "Mini Results"
+    echo "$response" | jq -r '.search_result[] | "\(.domain_name)|\(.registrant_contact.full_name // "N/A")|\(.registrant_contact.email_address // "N/A")|\(.registrant_contact.company_name // "N/A")"' |
+      while IFS="|" read -r domain name email company; do
+        printf "${bold}* ${green}%s${reset}\n" "$domain"
+        [ "$name" != "N/A" ] && printf "  ${cyan}Name:${reset} ${blue}%s${reset}\n" "$name"
+        [ "$email" != "N/A" ] && printf "  ${cyan}Email:${reset} ${blue}%s${reset}\n" "$email"
+        [ "$company" != "N/A" ] && printf "  ${cyan}Company:${reset} ${magenta}%s${reset}\n" "$company"
+      done
+  else
+    # Normal mode - full results
+    print_section "Full Results"
+    echo "$response" | jq -r '.search_result[] | "\(.domain_name)|\(.create_date)|\(.update_date)|\(.expire_date)|\(.registrant_contact)|\(.administrative_contact)"' |
+      while IFS="|" read -r domain create update expire registrant_raw admin_raw; do
+        printf "\n${bold}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${reset}\n"
+        printf "${bold}Domain:${reset} ${green}%s${reset}\n" "$domain"
+
+        if [ "$create" != "null" ] || [ "$update" != "null" ] || [ "$expire" != "null" ]; then
+          printf "${bold}Dates:${reset} "
+          [ "$create" != "null" ] && printf "Created: ${yellow}%s${reset}  " "$create"
+          [ "$update" != "null" ] && printf "Updated: ${yellow}%s${reset}  " "$update"
+          [ "$expire" != "null" ] && printf "Expires: ${yellow}%s${reset}" "$expire"
+          printf "\n"
+        fi
+
+        if [ "$registrant_raw" != "null" ]; then
+          format_contact "$registrant_raw" "Registrant"
+        fi
+
+        if [ "$admin_raw" != "null" ]; then
+          format_contact "$admin_raw" "Administrative"
+        fi
+      done
+  fi
+}
+
+show_help() {
+  echo "${bold}Whoxy API Client${reset}"
+  echo ""
+  echo "${bold}Commands:${reset}"
+  echo "  ${cyan}history${reset}       Get domain history lookup"
+  echo "  ${cyan}name${reset}          Search by domain owner's name"
+  echo "  ${cyan}email${reset}         Search by email address"
+  echo "  ${cyan}company${reset}       Search by company/organization name"
+  echo "  ${cyan}keyword${reset}       Search by keyword at start of domain name"
+  echo ""
+  echo "${bold}Examples:${reset}"
+  echo "  ${green}$(basename "$0") history example.com${reset}"
+  echo "  ${green}$(basename "$0") name \"John Doe\"${reset}"
+  echo "  ${green}$(basename "$0") email john@example.com${reset}"
+  echo "  ${green}$(basename "$0") company \"Example Corp\"${reset}"
+  echo "  ${green}$(basename "$0") keyword example --mode domains${reset}"
+  echo ""
+  echo "${bold}Options:${reset}"
+  echo "  ${yellow}-k, --key${reset}     Whoxy API key"
+  echo "  ${yellow}-p, --page${reset}    Page number for results pagination"
+  echo "  ${yellow}-m, --mode${reset}    Result mode (normal, mini, micro, domains)"
+  echo "  ${yellow}-j, --json${reset}    Output raw JSON"
+  echo "  ${yellow}-q, --quiet${reset}   Suppress colored output"
+  echo ""
+  echo "${bold}Modes:${reset}"
+  echo "  ${cyan}normal${reset}        Full contact information (default)"
+  echo "  ${cyan}mini${reset}          Basic contact info only"
+  echo "  ${cyan}micro${reset}         Domain names with dates only"
+  echo "  ${cyan}domains${reset}       Domain names only (keyword search only)"
+}
+
+# Main command processing
+if [ -z "$argc_command" ]; then
+  show_help
+  exit 0
+fi
+
+if [ -z "$argc_value" ]; then
+  echo "${red}Error:${reset} Search value is required." >&2
+  exit 1
+fi
+
+# Validate mode for keyword search
+if [ "$argc_mode" = "domains" ] && [ "$argc_command" != "keyword" ]; then
+  echo "${red}Error:${reset} domains mode can only be used with keyword search" >&2
+  exit 1
+fi
+
+# Process commands
+case "$argc_command" in
+history)
+  url="https://api.whoxy.com/?key=${API_KEY}&history=${argc_value}"
+  response=$(make_request "$url")
+  [ "$argc_json" = 1 ] && echo "$response" | jq || format_history "$response"
+  ;;
+
+name|email|company|keyword)
+  url="https://api.whoxy.com/?key=${API_KEY}&reverse=whois&${argc_command}=${argc_value}"
+
+  if [ "$argc_page" != "1" ]; then
+    url="${url}&page=${argc_page}"
+  fi
+
+  if [ "$argc_mode" != "normal" ]; then
+    url="${url}&mode=${argc_mode}"
+  fi
+
+  # URL encode spaces
+  url=$(echo "$url" | sed 's/ /+/g')
+
+  response=$(make_request "$url")
+  [ "$argc_json" = 1 ] && echo "$response" | jq || format_reverse_whois "$response" "$argc_command" "$argc_value"
+  ;;
+
+*)
+  echo "${red}Error:${reset} Unknown command: ${argc_command}" >&2
+  show_help
+  exit 1
+  ;;
+esac
