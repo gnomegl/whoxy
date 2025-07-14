@@ -438,29 +438,43 @@ format_reverse_whois() {
         [ "$company" != "N/A" ] && printf "  ${cyan}Company:${reset} ${magenta}%s${reset}\n" "$company"
       done
   else
-    # Normal mode - full results
+    # Normal mode - process each record individually
     print_section "Full Results"
-    echo "$response" | jq -r '.search_result[] | "\(.domain_name)|\(.create_date)|\(.update_date)|\(.expire_date)|\(.registrant_contact)|\(.administrative_contact)"' |
-      while IFS="|" read -r domain create update expire registrant_raw admin_raw; do
-        printf "\n${bold}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${reset}\n"
-        printf "${bold}Domain:${reset} ${green}%s${reset}\n" "$domain"
 
-        if [ "$create" != "null" ] || [ "$update" != "null" ] || [ "$expire" != "null" ]; then
-          printf "${bold}Dates:${reset} "
-          [ "$create" != "null" ] && printf "Created: ${yellow}%s${reset}  " "$create"
-          [ "$update" != "null" ] && printf "Updated: ${yellow}%s${reset}  " "$update"
-          [ "$expire" != "null" ] && printf "Expires: ${yellow}%s${reset}" "$expire"
-          printf "\n"
-        fi
+    # Get the length of the search_result array
+    local length=$(echo "$response" | jq '.search_result | length')
 
-        if [ "$registrant_raw" != "null" ]; then
-          format_contact "$registrant_raw" "Registrant"
-        fi
+    for ((i = 0; i < length; i++)); do
+      local record=$(echo "$response" | jq ".search_result[$i]")
 
-        if [ "$admin_raw" != "null" ]; then
-          format_contact "$admin_raw" "Administrative"
-        fi
-      done
+      local domain=$(echo "$record" | jq -r '.domain_name // "N/A"')
+      local create=$(echo "$record" | jq -r '.create_date // "null"')
+      local update=$(echo "$record" | jq -r '.update_date // "null"')
+      local expire=$(echo "$record" | jq -r '.expire_date // "null"')
+
+      printf "\n${bold}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${reset}\n"
+      printf "${bold}Domain:${reset} ${green}%s${reset}\n" "$domain"
+
+      if [ "$create" != "null" ] || [ "$update" != "null" ] || [ "$expire" != "null" ]; then
+        printf "${bold}Dates:${reset} "
+        [ "$create" != "null" ] && printf "Created: ${yellow}%s${reset}  " "$create"
+        [ "$update" != "null" ] && printf "Updated: ${yellow}%s${reset}  " "$update"
+        [ "$expire" != "null" ] && printf "Expires: ${yellow}%s${reset}" "$expire"
+        printf "\n"
+      fi
+
+      # Process contacts separately to avoid JSON parsing issues
+      local registrant_contact=$(echo "$record" | jq '.registrant_contact // null')
+      local admin_contact=$(echo "$record" | jq '.administrative_contact // null')
+
+      if [ "$registrant_contact" != "null" ]; then
+        format_contact "$registrant_contact" "Registrant"
+      fi
+
+      if [ "$admin_contact" != "null" ]; then
+        format_contact "$admin_contact" "Administrative"
+      fi
+    done
   fi
 }
 
@@ -520,7 +534,7 @@ history)
   [ "$argc_json" = 1 ] && echo "$response" | jq || format_history "$response"
   ;;
 
-name|email|company|keyword)
+name | email | company | keyword)
   url="https://api.whoxy.com/?key=${API_KEY}&reverse=whois&${argc_command}=${argc_value}"
 
   if [ "$argc_page" != "1" ]; then
